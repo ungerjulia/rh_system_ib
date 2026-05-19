@@ -1,9 +1,8 @@
 """
 RH Agent — Cloud Functions
-Backend completo: busca perfil (Proxycurl) + scoring IA (Claude)
+Backend: busca perfil (Proxycurl) + scoring IA (Claude)
 """
 import json
-import uuid
 import httpx
 import asyncio
 from datetime import datetime, timezone
@@ -13,11 +12,23 @@ from firebase_admin import firestore_async, auth
 from firebase_functions import https_fn, options
 from anthropic import AsyncAnthropic
 
-# ── Init ──────────────────────────────────────────────────────────────────────
-if not firebase_admin._apps:
-    firebase_admin.initialize_app()
-db = firestore_async.client()
-anthropic = AsyncAnthropic()  # lê ANTHROPIC_API_KEY das secrets do Firebase
+# ── Lazy init — evita erro de credenciais durante análise do deploy ───────────
+_db = None
+_anthropic = None
+
+def get_db():
+    global _db
+    if _db is None:
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        _db = firestore_async.client()
+    return _db
+
+def get_anthropic():
+    global _anthropic
+    if _anthropic is None:
+        _anthropic = AsyncAnthropic()
+    return _anthropic
 
 options.set_global_options(region=options.SupportedRegion.US_CENTRAL1)
 
@@ -42,6 +53,8 @@ def verify_token(req):
     if not header.startswith("Bearer "):
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Token ausente")
     try:
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
         return auth.verify_id_token(header.split(" ", 1)[1])["uid"]
     except Exception:
         raise https_fn.HttpsError(https_fn.FunctionsErrorCode.UNAUTHENTICATED, "Token inválido")
@@ -51,10 +64,6 @@ def verify_token(req):
 
 @https_fn.on_request(timeout_sec=300, memory=options.MemoryOption.MB_512)
 def process(req: https_fn.Request):
-    """
-    POST { jobId, candidateId }
-    Busca perfil no Proxycurl e pontua com Claude.
-    """
     if req.method == "OPTIONS":
         return json_resp({})
 
@@ -70,6 +79,7 @@ def process(req: https_fn.Request):
 
 
 async def _process(job_id: str, cand_id: str):
+    db = get_db()
     ref      = db.collection("jobs").document(job_id).collection("candidates").document(cand_id)
     cand_doc = await ref.get()
     job_doc  = await db.collection("jobs").document(job_id).get()
@@ -130,26 +140,22 @@ async def _fetch_profile(linkedin_url: str) -> dict:
 
 
 def _mock_profile(url: str) -> dict:
-    """Perfil simulado quando PROXYCURL_KEY não está configurado."""
     slug = url.rstrip("/").split("/in/")[-1]
     name = slug.replace("-", " ").title() if slug else "Candidato Teste"
     return {
         "full_name": name,
         "headline": "Analista de Comércio Exterior | SISCOMEX | Drawback | SC",
-        "summary": "Profissional com 6 anos de experiência em comércio exterior, importação, exportação, SISCOMEX e regimes aduaneiros especiais.",
+        "summary": "Profissional com 6 anos de experiência em comércio exterior.",
         "experiences": [
             {"company": "Exportadora Sul Ltda", "title": "Analista de Comércio Exterior Pleno",
-             "description": "Gestão de processos de importação e exportação, classificação NCM, SISCOMEX.",
+             "description": "Gestão de importação/exportação, NCM, SISCOMEX.",
              "starts_at": {"year": 2019}, "ends_at": None},
-            {"company": "Freight Solutions", "title": "Assistente de Logística Internacional",
-             "description": "Acompanhamento de embarques, emissão de BL, coordenação com armadores.",
-             "starts_at": {"year": 2017}, "ends_at": {"year": 2019}},
         ],
         "education": [
             {"school": "UNIVALI", "degree_name": "Bacharel em Comércio Exterior",
              "starts_at": {"year": 2013}, "ends_at": {"year": 2017}}
         ],
-        "skills": ["Comércio Exterior", "SISCOMEX", "NCM", "Drawback", "Incoterms", "Inglês"],
+        "skills": ["Comércio Exterior", "SISCOMEX", "NCM", "Drawback", "Incoterms"],
         "languages": [{"name": "Inglês", "proficiency": "PROFESSIONAL_WORKING"}],
     }
 
@@ -157,7 +163,7 @@ def _mock_profile(url: str) -> dict:
 # ── LLM Scoring ───────────────────────────────────────────────────────────────
 
 SYSTEM = """Você é especialista em recrutamento. Avalie candidatos com base na vaga.
-Responda SOMENTE em JSON válido, sem markdown, sem texto fora do JSON."""
+Responda SOMENTE em JSON válido, sem markdown."""
 
 PROMPT = """Vaga:
 {job}
@@ -203,7 +209,8 @@ def _fmt(p: dict) -> str:
 
 async def _score_candidate(profile: dict, job_description: str) -> dict:
     prompt = PROMPT.format(job=job_description, profile=_fmt(profile))
-    response = await anthropic.messages.create(
+    client = get_anthropic()
+    response = await client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1000,
         system=SYSTEM,
