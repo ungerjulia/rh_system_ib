@@ -1,9 +1,9 @@
 """
 RH Agent — Cloud Functions
-Backend: busca perfil (Proxycurl) + scoring IA (Claude)
+Backend: busca perfil (LinkdAPI) + scoring IA (Claude)
 """
 import json
-import httpx
+import os
 import asyncio
 from datetime import datetime, timezone
 
@@ -12,7 +12,7 @@ from firebase_admin import firestore_async, auth
 from firebase_functions import https_fn, options
 from anthropic import AsyncAnthropic
 
-# ── Lazy init — evita erro de credenciais durante análise do deploy ───────────
+# ── Lazy init ─────────────────────────────────────────────────────────────────
 _db = None
 _anthropic = None
 
@@ -120,26 +120,98 @@ async def _process(job_id: str, cand_id: str):
         return json_resp({"error": str(e)}, 500)
 
 
-# ── Proxycurl ─────────────────────────────────────────────────────────────────
+# ── LinkdAPI: busca perfil real ───────────────────────────────────────────────
 
 async def _fetch_profile(linkedin_url: str) -> dict:
-    import os
-    key = os.getenv("PROXYCURL_KEY", "")
+    """Busca perfil via LinkdAPI e normaliza para o formato interno."""
+    key = os.getenv("LINKDAPI_KEY", "")
     if not key:
         return _mock_profile(linkedin_url)
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            "https://nubela.co/proxycurl/api/v2/linkedin",
-            headers={"Authorization": f"Bearer {key}"},
-            params={"url": linkedin_url, "skills": "include", "use_cache": "if-present"},
-        )
-        if r.status_code == 200:
-            return r.json()
-        raise RuntimeError(f"Proxycurl {r.status_code}: {r.text[:200]}")
+    # Extrai username da URL
+    username = linkedin_url.rstrip("/").split("/in/")[-1].rstrip("/")
+    if not username or username == linkedin_url:
+        raise RuntimeError(f"URL inválida: {linkedin_url}")
+
+    try:
+        from linkdapi import AsyncLinkdAPI
+        async with AsyncLinkdAPI(key) as api:
+            # Busca perfil completo em chamadas paralelas
+            overview_resp = await api.get_profile_overview(username)
+            if not overview_resp.get("success"):
+                raise RuntimeError(f"Perfil não encontrado: {username}")
+
+            overview = overview_resp.get("data", {})
+            urn = overview.get("urn")
+
+            if urn:
+                exp_resp, edu_resp, skills_resp = await asyncio.gather(
+                    api.get_full_experience(urn),
+                    api.get_education(urn),
+                    api.get_skills(urn),
+                    return_exceptions=True
+                )
+            else:
+                exp_resp = edu_resp = skills_resp = {}
+
+            return _normalize_linkdapi(overview, exp_resp, edu_resp, skills_resp)
+
+    except ImportError:
+        raise RuntimeError("linkdapi não instalado")
+    except Exception as e:
+        raise RuntimeError(f"Erro LinkdAPI: {e}")
+
+
+def _normalize_linkdapi(overview: dict, exp_resp, edu_resp, skills_resp) -> dict:
+    """Converte resposta do LinkdAPI para o formato que o scoring espera."""
+
+    # Experiências
+    experiences = []
+    exp_data = exp_resp.get("data", []) if isinstance(exp_resp, dict) else []
+    for e in exp_data[:6]:
+        experiences.append({
+            "company": e.get("companyName") or e.get("company", "?"),
+            "title":   e.get("title", "?"),
+            "description": e.get("description", ""),
+            "starts_at": {"year": e.get("startYear")} if e.get("startYear") else None,
+            "ends_at":   {"year": e.get("endYear")}   if e.get("endYear")   else None,
+        })
+
+    # Educação
+    education = []
+    edu_data = edu_resp.get("data", []) if isinstance(edu_resp, dict) else []
+    for ed in edu_data[:3]:
+        education.append({
+            "school":      ed.get("schoolName", "?"),
+            "degree_name": ed.get("degree", "") + " " + ed.get("fieldOfStudy", ""),
+        })
+
+    # Skills
+    skills = []
+    sk_data = skills_resp.get("data", []) if isinstance(skills_resp, dict) else []
+    for s in sk_data[:20]:
+        name = s.get("name") or s.get("skill", "")
+        if name:
+            skills.append(name)
+
+    # Idiomas do overview
+    languages = []
+    for lang in (overview.get("languages") or [])[:5]:
+        languages.append({"name": lang.get("name", "?")})
+
+    return {
+        "full_name": overview.get("fullName") or f"{overview.get('firstName','')} {overview.get('lastName','')}".strip(),
+        "headline":  overview.get("headline", ""),
+        "summary":   overview.get("summary") or overview.get("about", ""),
+        "experiences": experiences,
+        "education":   education,
+        "skills":      skills,
+        "languages":   languages,
+    }
 
 
 def _mock_profile(url: str) -> dict:
+    """Perfil simulado quando LINKDAPI_KEY não está configurado."""
     slug = url.rstrip("/").split("/in/")[-1]
     name = slug.replace("-", " ").title() if slug else "Candidato Teste"
     return {
@@ -152,11 +224,10 @@ def _mock_profile(url: str) -> dict:
              "starts_at": {"year": 2019}, "ends_at": None},
         ],
         "education": [
-            {"school": "UNIVALI", "degree_name": "Bacharel em Comércio Exterior",
-             "starts_at": {"year": 2013}, "ends_at": {"year": 2017}}
+            {"school": "UNIVALI", "degree_name": "Bacharel em Comércio Exterior"}
         ],
         "skills": ["Comércio Exterior", "SISCOMEX", "NCM", "Drawback", "Incoterms"],
-        "languages": [{"name": "Inglês", "proficiency": "PROFESSIONAL_WORKING"}],
+        "languages": [{"name": "Inglês"}],
     }
 
 
@@ -193,7 +264,7 @@ def _fmt(p: dict) -> str:
     if p.get("summary"):
         lines.append(f"RESUMO: {p['summary']}")
     for e in (p.get("experiences") or [])[:4]:
-        yr  = (e.get("starts_at") or {}).get("year", "?")
+        yr  = (e.get("starts_at") or {}).get("year", "?") if e.get("starts_at") else "?"
         end = (e.get("ends_at") or {}).get("year", "atual") if e.get("ends_at") else "atual"
         lines.append(f"• {e.get('title')} @ {e.get('company')} ({yr}–{end})")
         if e.get("description"):
