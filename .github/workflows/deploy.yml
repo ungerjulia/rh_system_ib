@@ -38,3 +38,4 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
+          LINKDAPI_KEY: li-FDk3dIatrlSi23BBzs3DRS-jM_e9Yzii8zoG7S4dsj0_9_jMxlAgTqrlrq80YUJIOFbW_jNi2ZMMNSX03K3cjsLC107NDw
