@@ -16,8 +16,19 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
+
+      - name: Create Python venv for Functions
+        run: |
+          cd functions
+          python3.12 -m venv venv
+          venv/bin/pip install -r requirements.txt
 
       - name: Deploy Functions and Firestore
         run: |
