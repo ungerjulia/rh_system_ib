@@ -3,10 +3,7 @@ name: Deploy Firebase Functions
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'functions/**'
-      - 'firebase.json'
-      - 'firestore.rules'
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -19,24 +16,17 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
 
-      - name: Set Anthropic API Key secret
-        run: |
-          echo "${{ secrets.ANTHROPIC_API_KEY }}" | firebase functions:secrets:set ANTHROPIC_API_KEY \
-            --project rh-system-ib-818fc \
-            --non-interactive
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-
-      - name: Deploy Functions and Firestore
+      - name: Set Anthropic Secret and Deploy
         run: |
           echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > /tmp/sa.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json
-          firebase deploy --only functions,firestore --project rh-system-ib-818fc --non-interactive
+          
+          echo "${{ secrets.ANTHROPIC_API_KEY }}" | \
+            firebase functions:secrets:set ANTHROPIC_API_KEY \
+            --project rh-system-ib-818fc --non-interactive
+          
+          firebase deploy --only functions,firestore \
+            --project rh-system-ib-818fc --non-interactive
