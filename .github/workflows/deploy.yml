@@ -24,18 +24,17 @@ jobs:
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
 
-      - name: Create Python venv for Functions
+      - name: Create Python venv
         run: |
           cd functions
           python3.12 -m venv venv
           venv/bin/pip install -r requirements.txt
 
-      - name: Deploy Functions and Firestore
+      - name: Deploy
         run: |
           echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > /tmp/sa.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json
-          firebase deploy --only functions,firestore \
-            --project rh-system-ib-818fc --non-interactive
-       env:
+          firebase deploy --only functions,firestore --project rh-system-ib-818fc --non-interactive
+        env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
